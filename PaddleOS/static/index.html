@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PaddleOS – Lab Report Extractor</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, Segoe UI, sans-serif; margin: 0; background: #f4f6f8; color: #1f2933; }
+  header { background: #0f766e; color: #fff; padding: 16px 28px; }
+  header h1 { margin: 0; font-size: 22px; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: .85; }
+  main { max-width: 1250px; margin: 24px auto; padding: 0 20px; }
+
+  #drop { border: 2px dashed #94a3b8; border-radius: 12px; background: #fff; padding: 36px;
+          text-align: center; cursor: pointer; transition: .2s; }
+  #drop.over { border-color: #0f766e; background: #ecfdf5; }
+  #drop p { margin: 6px 0; color: #52606d; }
+  button { background: #0f766e; color: #fff; border: 0; border-radius: 8px; padding: 10px 22px;
+           font-size: 15px; cursor: pointer; margin-top: 14px; }
+  button:disabled { background: #9aa5b1; cursor: not-allowed; }
+  #status { margin: 14px 0; font-weight: 600; }
+  .error { color: #b91c1c; }
+
+  .layout { display: grid; grid-template-columns: 1fr 1.4fr; gap: 20px; margin-top: 20px; }
+  .card { background: #fff; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .card h2 { margin: 0 0 12px; font-size: 17px; }
+  #preview img { width: 100%; border-radius: 8px; border: 1px solid #e4e7eb; }
+
+  .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .badge { background: #f0f4f8; border-radius: 8px; padding: 8px 14px; font-size: 13px; }
+  .badge b { display: block; font-size: 18px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 16px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e4e7eb; }
+  th { background: #f8fafc; font-size: 12px; text-transform: uppercase; color: #52606d; }
+  tr.high td { background: #fee2e2; }
+  tr.low td { background: #ffedd5; }
+  .flag { font-weight: 700; font-size: 12px; }
+  .flag.high { color: #b91c1c; } .flag.low { color: #c2410c; } .flag.normal { color: #15803d; }
+
+  details { margin-top: 10px; }
+  pre { background: #1f2933; color: #e4e7eb; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 12px; }
+  .hidden { display: none; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧪 Lab Report Extractor</h1>
+  <p>PaddleOCR + local LLM (Ollama) · runs fully on this laptop – no data leaves it</p>
+</header>
+
+<main>
+  <div id="drop" onclick="fileInput.click()">
+    <p style="font-size:34px;margin:0">📄</p>
+    <p><b>Drag & drop</b> a lab report here, or <b>click to choose</b></p>
+    <p style="font-size:12px">JPG, PNG or PDF · max 10 MB</p>
+    <p id="fileName" style="color:#0f766e;font-weight:600"></p>
+  </div>
+  <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.pdf" hidden>
+  <button id="analyzeBtn" disabled onclick="analyze()">Analyze</button>
+  <div id="status"></div>
+
+  <div class="layout hidden" id="layout">
+    <div class="card">
+      <h2>Original report</h2>
+      <div id="preview"></div>
+    </div>
+    <div class="card">
+      <h2>Extracted results</h2>
+      <div id="results"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const drop = document.getElementById("drop");
+const fileInput = document.getElementById("fileInput");
+const btn = document.getElementById("analyzeBtn");
+const statusEl = document.getElementById("status");
+let selectedFile = null;
+let lastResult = null;
+
+// Escape text so odd OCR output can't break the page
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---------- File selection (click or drag & drop) ----------
+fileInput.onchange = () => pickFile(fileInput.files[0]);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); pickFile(e.dataTransfer.files[0]); };
+
+function pickFile(file) {
+  if (!file) return;
+  selectedFile = file;
+  document.getElementById("fileName").textContent = file.name;
+  btn.disabled = false;
+  statusEl.textContent = "";
+  document.getElementById("layout").classList.remove("hidden");
+  document.getElementById("results").innerHTML = "<p>Click <b>Analyze</b> to extract.</p>";
+  const preview = document.getElementById("preview");
+  if (file.type.startsWith("image/")) {
+    preview.innerHTML = `<img src="${URL.createObjectURL(file)}" alt="report">`;
+  } else {
+    preview.innerHTML = `<p>📄 ${esc(file.name)} (PDF preview not shown)</p>`;
+  }
+}
+
+// ---------- Upload and analyze ----------
+async function analyze() {
+  if (!selectedFile) return;
+  btn.disabled = true;
+  statusEl.className = "";
+  const start = Date.now();
+  const timer = setInterval(() => {
+    statusEl.textContent = `⏳ Analyzing... ${Math.round((Date.now() - start) / 1000)}s (OCR + LLM on CPU, ~2–3 min)`;
+  }, 1000);
+
+  const form = new FormData();
+  form.append("file", selectedFile);
+
+  try {
+    const res = await fetch("/analyze", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Request failed");
+    lastResult = data;
+    statusEl.textContent = `✅ Done in ${data.processing_seconds}s`;
+    render(data);
+  } catch (err) {
+    statusEl.className = "error";
+    statusEl.textContent = "❌ " + err.message;
+  } finally {
+    clearInterval(timer);
+    btn.disabled = false;
+  }
+}
+
+// ---------- Show results ----------
+function render(data) {
+  const r = data.extracted;
+  const abnormal = r.tests.filter(t => t.flag === "high" || t.flag === "low").length;
+  const conf = data.ocr_pages.reduce((s, p) => s + p.avg_confidence, 0) / data.ocr_pages.length;
+
+  let html = `<div class="badges">
+    <div class="badge"><b>${r.tests.length}</b>Tests</div>
+    <div class="badge"><b style="color:#b91c1c">${abnormal}</b>Abnormal</div>
+    <div class="badge"><b>${Math.round(conf * 100)}%</b>OCR confidence</div>
+    <div class="badge"><b>${data.timing.ocr_seconds}s / ${data.timing.llm_seconds}s</b>OCR / LLM</div>
+    <div class="badge"><b>${esc(data.model)}</b>Model</div>
+  </div>`;
+
+  const fields = ["patient_name", "age", "sex", "report_date", "sample_type", "method"];
+  const info = fields.filter(f => r[f]).map(f =>
+    `<b>${f.replace("_", " ")}:</b> ${esc(r[f])}`).join(" · ");
+  if (info) html += `<p>${info}</p>`;
+
+  html += `<table><tr><th>Test</th><th>Value</th><th>Unit</th><th>Reference range</th><th>Flag</th></tr>`;
+  for (const t of r.tests) {
+    const f = t.flag || "";
+    html += `<tr class="${f}">
+      <td>${esc(t.test_name)}</td><td><b>${esc(t.value)}</b></td><td>${esc(t.unit)}</td>
+      <td>${esc(t.reference_range)}</td>
+      <td class="flag ${f}">${f ? f.toUpperCase() : "—"}</td></tr>`;
+  }
+  html += `</table>`;
+
+  if (r.other_findings.length) {
+    html += `<table><tr><th>Finding</th><th>Result</th></tr>`;
+    for (const f of r.other_findings) html += `<tr><td>${esc(f.name)}</td><td>${esc(f.result)}</td></tr>`;
+    html += `</table>`;
+  }
+
+  html += `<details><summary>Raw OCR rows</summary>
+    <pre>${esc(data.ocr_pages.map(p => p.rows.join("\n")).join("\n\n"))}</pre></details>
+    <button onclick="downloadJSON()">⬇️ Download JSON</button>`;
+
+  document.getElementById("results").innerHTML = html;
+}
+
+function downloadJSON() {
+  const blob = new Blob([JSON.stringify(lastResult, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (lastResult.filename || "report").replace(/\.[^.]+$/, "") + ".json";
+  a.click();
+}
+</script>
+</body>
+</html>

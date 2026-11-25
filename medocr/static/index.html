@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MedOCR — Lab Report Reader</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f4f6f8; color: #1f2937; }
+  header { background: #0f766e; color: white; padding: 16px 24px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; opacity: .85; font-size: 13px; }
+  main { max-width: 1200px; margin: 24px auto; padding: 0 16px; }
+  .card { background: white; border-radius: 10px; padding: 18px; margin-bottom: 16px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  #drop { border: 2px dashed #94a3b8; border-radius: 10px; padding: 30px; text-align: center;
+          cursor: pointer; transition: .2s; }
+  #drop.over { background: #ecfdf5; border-color: #0f766e; }
+  button { background: #0f766e; color: white; border: 0; padding: 10px 22px; border-radius: 8px;
+           font-size: 15px; cursor: pointer; margin-top: 12px; }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  .warn { font-size: 12px; color: #b45309; margin-top: 8px; }
+  .layout { display: grid; grid-template-columns: 1fr 1.4fr; gap: 16px; align-items: start; }
+  #preview { width: 100%; border-radius: 8px; border: 1px solid #e5e7eb; }
+  .badges span { display: inline-block; background: #e0f2f1; color: #0f766e; padding: 4px 10px;
+                 border-radius: 20px; font-size: 13px; margin: 0 6px 6px 0; }
+  .info { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; font-size: 14px; }
+  .info b { color: #6b7280; font-weight: 500; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e5e7eb; }
+  th { background: #f9fafb; }
+  tr.high td { background: #fef2f2; }  tr.low td { background: #fff7ed; }
+  .flag { font-weight: 600; text-transform: uppercase; font-size: 12px; }
+  .flag.high { color: #dc2626; } .flag.low { color: #ea580c; } .flag.normal { color: #16a34a; }
+  pre { background: #111827; color: #e5e7eb; padding: 12px; border-radius: 8px; overflow: auto;
+        font-size: 12px; max-height: 300px; }
+  .error { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+  .hidden { display: none; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MedOCR</h1>
+  <p>Upload a lab report → PaddleOCR reads it → Gemini structures it</p>
+</header>
+
+<main>
+  <!-- Upload -->
+  <div class="card">
+    <div id="drop">📄 Drag & drop a report image here, or click to choose<br>
+      <small>JPG, PNG, WEBP — max 10 MB</small></div>
+    <input type="file" id="file" accept=".jpg,.jpeg,.png,.webp" hidden>
+    <button id="go" disabled>Analyze</button>
+    <span id="status"></span>
+    <div class="warn">⚠ Use dummy or blurred reports only — the extracted text is sent to Google Gemini.</div>
+  </div>
+
+  <div id="error" class="card error hidden"></div>
+
+  <!-- Results: image on the left, data on the right (for human checking) -->
+  <div class="layout">
+    <div class="card hidden" id="imgCard"><h2>Original</h2><img id="preview"></div>
+
+    <div id="results" class="hidden">
+      <div class="card"><div class="badges" id="badges"></div></div>
+      <div class="card"><h2>Patient & Report</h2><div class="info" id="info"></div></div>
+      <div class="card"><h2>Test Results</h2>
+        <table><thead><tr><th>Test</th><th>Value</th><th>Unit</th><th>Reference</th><th>Flag</th></tr></thead>
+        <tbody id="tests"></tbody></table>
+      </div>
+      <div class="card" id="notesCard"><h2>Notes</h2><div id="notes"></div></div>
+      <div class="card"><details><summary>Raw OCR text</summary><pre id="raw"></pre></details></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const drop = document.getElementById("drop"), fileInput = document.getElementById("file");
+const go = document.getElementById("go"), statusEl = document.getElementById("status");
+let selected = null;
+
+// --- choose file (click or drag & drop) ---
+drop.onclick = () => fileInput.click();
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); pick(e.dataTransfer.files[0]); };
+fileInput.onchange = () => pick(fileInput.files[0]);
+
+function pick(file) {
+  if (!file) return;
+  selected = file;
+  drop.innerHTML = `✅ ${file.name}<br><small>Click to change</small>`;
+  document.getElementById("preview").src = URL.createObjectURL(file);
+  document.getElementById("imgCard").classList.remove("hidden");
+  go.disabled = false;
+}
+
+// --- send to backend ---
+go.onclick = async () => {
+  const form = new FormData();
+  form.append("file", selected);
+
+  go.disabled = true;
+  hide("results"); hide("error");
+  const start = Date.now();
+  const timer = setInterval(() =>
+    statusEl.textContent = `  ⏳ Analyzing... ${Math.round((Date.now() - start) / 1000)}s`, 500);
+
+  try {
+    const res = await fetch("/analyze", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Request failed");
+    if (data.error) throw new Error(data.error);
+    render(data);
+    statusEl.textContent = "  ✅ Done";
+  } catch (err) {
+    showError(err.message);
+    statusEl.textContent = "";
+  } finally {
+    clearInterval(timer);
+    go.disabled = false;
+  }
+};
+
+// --- show results ---
+function render(d) {
+  const r = d.result || {}, p = r.patient || {}, rep = r.report || {};
+
+  document.getElementById("badges").innerHTML = `
+    <span>OCR confidence: ${d.ocr_confidence}%</span>
+    <span>OCR: ${d.timing?.ocr_seconds}s</span>
+    <span>LLM: ${d.timing?.llm_seconds}s</span>
+    <span>Total: ${d.processing_seconds}s</span>
+    ${d.low_confidence_words?.length ? `<span style="background:#fef3c7;color:#b45309">
+      Low-confidence words: ${d.low_confidence_words.map(esc).join(", ")}</span>` : ""}`;
+
+  const rows = [["Name", p.name], ["Sex", p.sex], ["Age", p.age], ["Patient ID", p.patient_id],
+                ["Lab", rep.lab_name], ["Date", rep.report_date], ["Ref. doctor", rep.ref_doctor],
+                ["Report type", rep.report_type]];
+  document.getElementById("info").innerHTML =
+    rows.map(([k, v]) => `<div><b>${k}:</b> ${esc(v ?? "—")}</div>`).join("");
+
+  document.getElementById("tests").innerHTML = (r.tests || []).map(t => `
+    <tr class="${t.flag || ""}">
+      <td>${esc(t.name)}</td><td><b>${esc(t.value)}</b></td><td>${esc(t.unit ?? "")}</td>
+      <td>${esc(t.reference_range ?? "")}</td>
+      <td class="flag ${t.flag || ""}">${t.flag || "—"}</td>
+    </tr>`).join("");
+
+  document.getElementById("notes").textContent = r.notes || "";
+  document.getElementById("notesCard").classList.toggle("hidden", !r.notes);
+  document.getElementById("raw").textContent = d.ocr_text || "";
+  show("results");
+}
+
+function showError(msg) {
+  const el = document.getElementById("error");
+  el.textContent = "❌ " + msg;
+  show("error");
+}
+function show(id) { document.getElementById(id).classList.remove("hidden"); }
+function hide(id) { document.getElementById(id).classList.add("hidden"); }
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+</script>
+</body>
+</html>

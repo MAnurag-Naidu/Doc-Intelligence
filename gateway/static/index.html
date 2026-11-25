@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCR Gateway — images → medocr, PDFs → PaddleOS</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f4f6f8; color: #1f2937; }
+  header { background: #0f766e; color: white; padding: 16px 24px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; opacity: .85; font-size: 13px; }
+  main { max-width: 1200px; margin: 24px auto; padding: 0 16px; }
+  .card { background: white; border-radius: 10px; padding: 18px; margin-bottom: 16px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  #drop { border: 2px dashed #94a3b8; border-radius: 10px; padding: 30px; text-align: center;
+          cursor: pointer; transition: .2s; }
+  #drop.over { background: #ecfdf5; border-color: #0f766e; }
+  button { background: #0f766e; color: white; border: 0; padding: 10px 22px; border-radius: 8px;
+           font-size: 15px; cursor: pointer; margin-top: 12px; }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  .warn { font-size: 12px; color: #b45309; margin-top: 8px; }
+  .route { font-size: 13px; margin-top: 8px; color: #374151; }
+  .route b { color: #0f766e; }
+  .layout { display: grid; grid-template-columns: 1fr 1.4fr; gap: 16px; align-items: start; }
+  #preview { width: 100%; border-radius: 8px; border: 1px solid #e5e7eb; }
+  .pdfnote { padding: 24px; text-align: center; color: #6b7280; font-size: 14px; }
+  .badges span { display: inline-block; background: #e0f2f1; color: #0f766e; padding: 4px 10px;
+                 border-radius: 20px; font-size: 13px; margin: 0 6px 6px 0; }
+  .badges span.engine { background: #0f766e; color: white; }
+  .info { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; font-size: 14px; }
+  .info b { color: #6b7280; font-weight: 500; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e5e7eb; }
+  th { background: #f9fafb; }
+  tr.high td { background: #fef2f2; }  tr.low td { background: #fff7ed; }
+  .flag { font-weight: 600; text-transform: uppercase; font-size: 12px; }
+  .flag.high { color: #dc2626; } .flag.low { color: #ea580c; } .flag.normal { color: #16a34a; }
+  pre { background: #111827; color: #e5e7eb; padding: 12px; border-radius: 8px; overflow: auto;
+        font-size: 12px; max-height: 300px; }
+  .error { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+  .hidden { display: none; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OCR Gateway</h1>
+  <p>Images &amp; screenshots → medocr (Gemini) &nbsp;·&nbsp; PDFs → PaddleOS (local Ollama)</p>
+</header>
+
+<main>
+  <!-- Upload -->
+  <div class="card">
+    <div id="drop">📄 Drag &amp; drop an image, screenshot, or PDF here, or click to choose<br>
+      <small>JPG, PNG, WEBP, PDF — max 10 MB</small></div>
+    <input type="file" id="file" accept=".jpg,.jpeg,.png,.webp,.pdf" hidden>
+    <button id="go" disabled>Analyze</button>
+    <span id="status"></span>
+    <div class="route" id="route"></div>
+    <div class="warn">⚠ Use dummy or blurred reports only — image text is sent to Google Gemini; PDF text is read by local Ollama.</div>
+  </div>
+
+  <div id="error" class="card error hidden"></div>
+
+  <div class="layout">
+    <div class="card hidden" id="previewCard"><h2>Original</h2>
+      <img id="preview" class="hidden">
+      <div id="pdfnote" class="pdfnote hidden">📑 PDF selected — preview not shown.</div>
+    </div>
+
+    <div id="results" class="hidden">
+      <div class="card"><div class="badges" id="badges"></div></div>
+      <div class="card"><h2>Patient &amp; Report</h2><div class="info" id="info"></div></div>
+      <div class="card"><h2>Test Results</h2>
+        <table><thead><tr><th>Test</th><th>Value</th><th>Unit</th><th>Reference</th><th>Flag</th></tr></thead>
+        <tbody id="tests"></tbody></table>
+      </div>
+      <div class="card hidden" id="findingsCard"><h2>Other Findings</h2>
+        <table><thead><tr><th>Finding</th><th>Result</th></tr></thead>
+        <tbody id="findings"></tbody></table>
+      </div>
+      <div class="card hidden" id="notesCard"><h2>Notes</h2><div id="notes"></div></div>
+      <div class="card"><details><summary>Raw OCR text</summary><pre id="raw"></pre></details></div>
+      <div class="card"><button id="download">⬇️ Download JSON</button></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const drop = document.getElementById("drop"), fileInput = document.getElementById("file");
+const go = document.getElementById("go"), statusEl = document.getElementById("status");
+const routeEl = document.getElementById("route");
+let selected = null, lastResult = null;
+
+const isPdf = f => /\.pdf$/i.test(f.name);
+const engineFor = f => isPdf(f) ? "PaddleOS (PDF)" : "medocr (image)";
+
+// --- choose file (click or drag & drop) ---
+drop.onclick = () => fileInput.click();
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); pick(e.dataTransfer.files[0]); };
+fileInput.onchange = () => pick(fileInput.files[0]);
+
+function pick(file) {
+  if (!file) return;
+  selected = file;
+  drop.innerHTML = `✅ ${esc(file.name)}<br><small>Click to change</small>`;
+  routeEl.innerHTML = `Will be routed to <b>${esc(engineFor(file))}</b>`;
+
+  const img = document.getElementById("preview"), note = document.getElementById("pdfnote");
+  if (isPdf(file)) {
+    img.classList.add("hidden");
+    note.classList.remove("hidden");
+  } else {
+    img.src = URL.createObjectURL(file);
+    img.classList.remove("hidden");
+    note.classList.add("hidden");
+  }
+  document.getElementById("previewCard").classList.remove("hidden");
+  go.disabled = false;
+}
+
+// --- send to gateway ---
+go.onclick = async () => {
+  const form = new FormData();
+  form.append("file", selected);
+
+  go.disabled = true;
+  hide("results"); hide("error");
+  const start = Date.now();
+  const engine = engineFor(selected);
+  const timer = setInterval(() =>
+    statusEl.textContent = `  ⏳ ${engine} analyzing... ${Math.round((Date.now() - start) / 1000)}s`, 500);
+
+  try {
+    const res = await fetch("/analyze", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Request failed");
+    if (data.error) throw new Error(data.error);
+    lastResult = data;
+    render(data);
+    statusEl.textContent = "  ✅ Done";
+  } catch (err) {
+    showError(err.message);
+    statusEl.textContent = "";
+  } finally {
+    clearInterval(timer);
+    go.disabled = false;
+  }
+};
+
+// --- show results ---
+function render(d) {
+  const p = d.patient || {}, rep = d.report || {}, t = d.timing || {};
+
+  document.getElementById("badges").innerHTML = `
+    <span class="engine">Engine: ${esc(d.engine)}</span>
+    ${t.ocr_seconds != null ? `<span>OCR: ${t.ocr_seconds}s</span>` : ""}
+    ${t.llm_seconds != null ? `<span>LLM: ${t.llm_seconds}s</span>` : ""}
+    ${d.processing_seconds != null ? `<span>Total: ${d.processing_seconds}s</span>` : ""}`;
+
+  const rows = [["Name", p.name], ["Sex", p.sex], ["Age", p.age], ["Patient ID", p.patient_id],
+                ["Lab", rep.lab_name], ["Date", rep.report_date], ["Ref. doctor", rep.ref_doctor],
+                ["Report type", rep.report_type], ["Sample", rep.sample_type],
+                ["Method", rep.method], ["Model", rep.model]];
+  document.getElementById("info").innerHTML =
+    rows.filter(([, v]) => v != null && v !== "")
+        .map(([k, v]) => `<div><b>${k}:</b> ${esc(v)}</div>`).join("") || "<div>—</div>";
+
+  document.getElementById("tests").innerHTML = (d.tests || []).map(x => `
+    <tr class="${x.flag || ""}">
+      <td>${esc(x.name)}</td><td><b>${esc(x.value)}</b></td><td>${esc(x.unit ?? "")}</td>
+      <td>${esc(x.reference_range ?? "")}</td>
+      <td class="flag ${x.flag || ""}">${x.flag || "—"}</td>
+    </tr>`).join("");
+
+  const findings = d.other_findings || [];
+  document.getElementById("findings").innerHTML = findings.map(f =>
+    `<tr><td>${esc(f.name)}</td><td>${esc(f.result)}</td></tr>`).join("");
+  document.getElementById("findingsCard").classList.toggle("hidden", !findings.length);
+
+  document.getElementById("notes").textContent = d.notes || "";
+  document.getElementById("notesCard").classList.toggle("hidden", !d.notes);
+
+  document.getElementById("raw").textContent = d.raw_text || "";
+  show("results");
+}
+
+document.getElementById("download").onclick = () => {
+  if (!lastResult) return;
+  const blob = new Blob([JSON.stringify(lastResult, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (lastResult.filename || "report").replace(/\.[^.]+$/, "") + ".json";
+  a.click();
+};
+
+function showError(msg) {
+  const el = document.getElementById("error");
+  el.textContent = "❌ " + msg;
+  show("error");
+}
+function show(id) { document.getElementById(id).classList.remove("hidden"); }
+function hide(id) { document.getElementById(id).classList.add("hidden"); }
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+</script>
+</body>
+</html>

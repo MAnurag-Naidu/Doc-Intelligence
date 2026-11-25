@@ -1,0 +1,28 @@
+# Virtual environments (huge, machine-specific — never commit)
+venv/
+.venv/
+*/venv/
+*/.venv/
+
+# Secrets
+.env
+*/.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime / temp output
+*/uploads/
+*/outputs/
+*/output/
+*/output_structure/
+*/run.out
+*/run.err
+gw.out
+gw.err
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
